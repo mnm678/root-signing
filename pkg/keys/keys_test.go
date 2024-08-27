@@ -1,8 +1,28 @@
+//
+// Copyright 2021 The Sigstore Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package keys
 
 import (
-	"io/ioutil"
+	"context"
+	"os"
 	"testing"
+
+	csignature "github.com/sigstore/cosign/v2/pkg/signature"
+	"github.com/sigstore/sigstore/pkg/cryptoutils"
+	"github.com/theupdateframework/go-tuf/pkg/keys"
 )
 
 // Generated with:
@@ -135,24 +155,61 @@ func TestToSigningKey(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := ToSigningKey(123, tt.pub, tt.deviceCert, tt.keyCert)
+			key, err := ToSigningKey(123, tt.pub, tt.deviceCert, tt.keyCert)
 			if tt.expectSuccess != (err == nil) {
 				t.Errorf("unexpected error generating signing key (%s): %s", tt.name, err)
+			}
+			if tt.expectSuccess {
+				pemPubKey, err := EcdsaTufKey(key.PublicKey, true)
+				if err != nil {
+					t.Errorf("unexpected error generating PEM TUF public key: %s", err)
+				}
+				// Try to get verifiers.
+				_, err = keys.GetVerifier(pemPubKey)
+				if err != nil {
+					t.Errorf("unexpected error getting TUF PEM ecdsa verifier: %s", err)
+				}
 			}
 		})
 	}
 }
 
+func TestGetSigningKey(t *testing.T) {
+	ctx := context.Background()
+
+	keyRef := "../../tests/test_data/cosign.key"
+	signingKey, err := csignature.SignerVerifierFromKeyRef(ctx, keyRef, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("valid signing key with PEM", func(t *testing.T) {
+		signingKeyPem, err := ConstructTufKey(ctx, signingKey, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = keys.GetVerifier(signingKeyPem)
+		if err != nil {
+			t.Fatalf("unexpected error getting TUF PEM ecdsa verifier: %s", err)
+		}
+		// Try with explicit verifier.
+		pemKey := keys.NewEcdsaVerifier()
+		if err := pemKey.UnmarshalPublicKey(signingKeyPem); err != nil {
+			t.Errorf("unexpected error getting TUF PEM ecdsa verifier: %s", err)
+		}
+	})
+}
+
 func TestVerify(t *testing.T) {
-	pubkey, err := ioutil.ReadFile("../../tests/test_data/10550341/10550341_pubkey.pem")
+	pubkey, err := os.ReadFile("../../tests/test_data/10550341/10550341_pubkey.pem")
 	if err != nil {
 		t.Fatal("error opening test data")
 	}
-	deviceCert, err := ioutil.ReadFile("../../tests/test_data/10550341/10550341_device_cert.pem")
+	deviceCert, err := os.ReadFile("../../tests/test_data/10550341/10550341_device_cert.pem")
 	if err != nil {
 		t.Fatal("error opening test data")
 	}
-	keyCert, err := ioutil.ReadFile("../../tests/test_data/10550341/10550341_key_cert.pem")
+	keyCert, err := os.ReadFile("../../tests/test_data/10550341/10550341_key_cert.pem")
 	if err != nil {
 		t.Fatal("error opening test data")
 	}
@@ -163,14 +220,14 @@ func TestVerify(t *testing.T) {
 	}
 
 	// Use Yubico root CA
-	root, err := ToCert([]byte(rootCA))
+	roots, err := cryptoutils.UnmarshalCertificatesFromPEMLimited([]byte(rootCA), 1)
 	if err != nil {
 		t.Fatal("error creating root CA certificate")
 	}
 
 	{
 		// Verify signing key
-		if err = signingKey.Verify(root); err != nil {
+		if err = signingKey.Verify(roots[0]); err != nil {
 			t.Fatal("unexpected error verifying signing key")
 		}
 	}
@@ -179,7 +236,7 @@ func TestVerify(t *testing.T) {
 	{
 		badSigningKey := signingKey
 		badSigningKey.KeyCert.Extensions = nil
-		if err := badSigningKey.Verify(root); err == nil {
+		if err := badSigningKey.Verify(roots[0]); err == nil {
 			t.Fatal("expected error verifying signing key with missing serial number in key cert")
 		}
 	}
@@ -188,7 +245,7 @@ func TestVerify(t *testing.T) {
 	{
 		badSigningKey := signingKey
 		badSigningKey.SerialNumber = 123
-		if err := badSigningKey.Verify(root); err == nil {
+		if err := badSigningKey.Verify(roots[0]); err == nil {
 			t.Fatal("expected error verifying signing key with mismatching serial number")
 		}
 	}

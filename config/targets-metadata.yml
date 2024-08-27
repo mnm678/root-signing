@@ -1,29 +1,37 @@
-# Target files and metadata under top-level targets
-targets/fulcio_v1.crt.pem:
-  sigstore:
-    usage: Fulcio
-    status: Active
-targets/fulcio_intermediate_v1.crt.pem:
-  sigstore:
-    usage: Fulcio
-    status: Active
-targets/fulcio.crt.pem:
-  sigstore:
-    usage: Fulcio
-    status: Expired
-targets/artifact.pub:
-  sigstore:
-    usage: Unknown
-    status: Active
-targets/ctfe.pub:
-  sigstore:
-    usage: CTFE
-    status: Active
-targets/rekor.pub:
-  sigstore:
-    usage: Rekor
-    status: Active
-targets/rekor.0.pub:
-  sigstore:
-    usage: Rekor
-    status: Active 
+# The top-level targets paths.
+add:
+  fulcio_v1.crt.pem:
+    sigstore:
+      uri: https://fulcio.sigstore.dev
+      usage: Fulcio
+      status: Active
+  fulcio_intermediate_v1.crt.pem:
+    sigstore:
+      uri: https://fulcio.sigstore.dev
+      usage: Fulcio
+      status: Active
+  fulcio.crt.pem:
+    sigstore:
+      uri: https://fulcio.sigstore.dev
+      usage: Fulcio
+      status: Expired
+  ctfe.pub:
+    sigstore:
+      uri: https://ctfe.sigstore.dev/test
+      usage: CTFE
+      status: Active
+  ctfe_2022.pub:
+    sigstore:
+      uri: https://ctfe.sigstore.dev/2022
+      usage: CTFE
+      status: Active
+  rekor.pub:
+    sigstore:
+      uri: https://rekor.sigstore.dev
+      usage: Rekor
+      status: Active
+  artifact.pub:
+    sigstore:
+      usage: Unknown
+      status: Active
+  trusted_root.json:

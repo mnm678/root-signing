@@ -1,3 +1,18 @@
+//
+// Copyright 2021 The Sigstore Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //go:build pivkey
 // +build pivkey
 
@@ -6,10 +21,6 @@ package app
 import (
 	"context"
 	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/x509"
-	"encoding/json"
-	"encoding/pem"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -17,9 +28,8 @@ import (
 	"path/filepath"
 
 	"github.com/peterbourgon/ff/v3/ffcli"
-	"github.com/sigstore/cosign/cmd/cosign/cli/pivcli"
-	"github.com/sigstore/root-signing/pkg/keys"
-	"github.com/theupdateframework/go-tuf/data"
+	"github.com/sigstore/cosign/v2/cmd/cosign/cli/pivcli"
+	"github.com/sigstore/sigstore/pkg/cryptoutils"
 	"golang.org/x/term"
 )
 
@@ -50,8 +60,8 @@ func AddKey() *ffcli.Command {
 }
 
 type KeyAndAttestations struct {
-	attestations pivcli.Attestations
-	key          *data.PublicKey
+	Attestations pivcli.Attestations
+	Key          *ecdsa.PublicKey
 }
 
 func GetKeyAndAttestation(ctx context.Context) (*KeyAndAttestations, error) {
@@ -61,18 +71,8 @@ func GetKeyAndAttestation(ctx context.Context) (*KeyAndAttestations, error) {
 	}
 
 	pub := attestations.KeyCert.PublicKey.(*ecdsa.PublicKey)
-	keyValBytes, err := json.Marshal(keys.EcdsaPublic{PublicKey: elliptic.Marshal(pub.Curve, pub.X, pub.Y)})
-	if err != nil {
-		return nil, err
-	}
-	pk := &data.PublicKey{
-		Type:       data.KeyTypeECDSA_SHA2_P256,
-		Scheme:     data.KeySchemeECDSA_SHA2_P256,
-		Algorithms: data.HashAlgorithms,
-		Value:      keyValBytes,
-	}
 
-	return &KeyAndAttestations{attestations: *attestations, key: pk}, nil
+	return &KeyAndAttestations{Attestations: *attestations, Key: pub}, nil
 }
 
 func AddKeyCmd(ctx context.Context, directory string) error {
@@ -84,12 +84,11 @@ func AddKeyCmd(ctx context.Context, directory string) error {
 		return err
 	}
 
-	fmt.Fprintf(os.Stderr, "Resetting PIN. Enter a new PIN between 6 and 8 characters: ")
+	fmt.Fprintf(os.Stderr, "Resetting PIN. Enter a new PIN between 6 and 8 characters: \n")
 	pin, err := term.ReadPassword(0)
 	if err != nil {
 		return err
 	}
-	fmt.Println(os.Stderr)
 	if err := pivcli.SetPinCmd(ctx, "", string(pin)); err != nil {
 		return err
 	}
@@ -104,21 +103,17 @@ func AddKeyCmd(ctx context.Context, directory string) error {
 }
 
 func WriteKeyData(keyAndAttestations *KeyAndAttestations, directory string) error {
-	att := keyAndAttestations.attestations
+	att := keyAndAttestations.Attestations
 	serial := fmt.Sprint(att.KeyAttestation.Serial)
 	keyDir := filepath.Join(directory, "keys", serial)
 	if err := os.MkdirAll(keyDir, 0755); err != nil {
 		return err
 	}
 
-	b, err := x509.MarshalPKIXPublicKey(keyAndAttestations.attestations.KeyCert.PublicKey)
+	pemBytes, err := cryptoutils.MarshalPublicKeyToPEM(keyAndAttestations.Attestations.KeyCert.PublicKey)
 	if err != nil {
 		return err
 	}
-	pemBytes := pem.EncodeToMemory(&pem.Block{
-		Type:  "PUBLIC KEY",
-		Bytes: b,
-	})
 	pubKeyFile := filepath.Join(keyDir, serial+"_pubkey.pem")
 	if err := ioutil.WriteFile(pubKeyFile, pemBytes, 0644); err != nil {
 		return err

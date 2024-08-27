@@ -1,37 +1,41 @@
-#!/bin/bash
+#!/usr/bin/env bash
+#
+# Copyright 2021 The Sigstore Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 # Print all commands and stop on errors
-set -ex
+set -o errexit
+set -o xtrace
 
-if [ -z "$GITHUB_USER" ]; then
-    echo "Set GITHUB_USER"
-    exit
-fi
+# shellcheck source=./scripts/utils.sh
+source "./scripts/utils.sh"
+
+# Check that a github user is set.
+check_user
 
 # Dump the git state
-git status
-git remote -v
+print_git_state
 
 # Setup forks
-git remote rm upstream || true
-git remote add upstream git@github.com:sigstore/root-signing.git
-git remote rm origin || true
-git remote add origin git@github.com:"$GITHUB_USER"/root-signing.git
-git remote -v
-
+setup_forks
 
 # Cleanup branches
-git branch -D setup-root || true
-git branch -D add-key || true
-git branch -D sign-targets || true
-git branch -D sign-snapshot || true
-git branch -D sign-timestamp || true
-git branch -D publish || true
+cleanup_branches
+clean_state
 
-git clean -d -f
-git checkout main
-git pull upstream main
-git rev-parse HEAD
+# Checkout the working branch
+checkout_branch
 
 # build the tuf binary
 go build -o tuf -tags=pivkey ./cmd/tuf

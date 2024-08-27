@@ -1,12 +1,32 @@
-#!/bin/bash
+#!/usr/bin/env bash
+#
+# Copyright 2021 The Sigstore Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 # Print all commands and stop on errors
-set -ex
+set -o errexit
+set -o xtrace
 
-if [ -z "$GITHUB_USER" ]; then
-    echo "Set GITHUB_USER"
-    exit
-fi
+# shellcheck source=./scripts/utils.sh
+source "./scripts/utils.sh"
+
+# Check that a github user is set.
+check_user
+
+# Set REPO
+set_repository
+
 # Online top-level keys
 if [ -z "$TIMESTAMP_KEY" ]; then
     echo "Set TIMESTAMP_KEY"
@@ -16,57 +36,25 @@ if [ -z "$SNAPSHOT_KEY" ]; then
     echo "Set SNAPSHOT_KEY"
     exit
 fi
-# Delegation keys
-if [ -z "$REKOR_KEY" ]; then
-    echo "Set REKOR_KEY"
-    exit
-fi
-if [ -z "$STAGING_KEY" ]; then
-    echo "Set STAGING_KEY"
-    exit
-fi
-if [ -z "$REVOCATION_KEY" ]; then
-    echo "Set REVOCATION_KEY"
-    exit
-fi
-# Repo options
-if [ -z "$PREV_REPO" ]; then
-    echo "Set PREV_REPO"
-    exit
-fi
-if [ -z "$CEREMONY_DATE" ]; then
-    CEREMONY_DATE=$(date '+%Y-%m-%d')
-fi
-export REPO=$(pwd)/ceremony/$CEREMONY_DATE
+# TODO(https://github.com/sigstore/root-signing/issues/398):
+# Add any necessary delegation keys
 
-# Dump the git state
-git status
-git remote -v
+# Dump the git state and clean-up
+print_git_state
+clean_state
 
-git clean -d -f
-git checkout main
-git pull upstream main
-git status
+# Checkout the working branch
+checkout_branch
 
-# Copy the previous keys and repository into the new repository.
-cp -r ${PREV_REPO}/* ${REPO}
-mkdir -p ${REPO}/staged/targets
+# Remove a key by ID that need to be removed from the root keyholders
+if [[ -n $1 ]]; then
+    echo "Removing key: $1"
+    rm -r "${REPO}"/keys/"$1"
+fi
 
 # Setup the root and targets
-./tuf init -repository $REPO -target-meta config/targets-metadata.yml -snapshot ${SNAPSHOT_KEY} -timestamp ${TIMESTAMP_KEY} -previous "${PREV_REPO}"
-# Add rekor delegation
-cp targets/rekor.pub targets/rekor.0.pub
-./tuf add-delegation -repository $REPO -name "rekor" -key $REKOR_KEY -path "rekor.*.pub" -target-meta config/rekor-metadata.yml
-# Add staging project delegation
-./tuf add-delegation -repository $REPO -name "staging" -key $STAGING_KEY -path "*"
-# TODO: Add revoked project delegation
-./tuf add-delegation -repository $REPO -name "revocation" -key $REVOCATION_KEY -path "*" -target-meta config/revocation-metadata.yml
+./tuf init -repository "$REPO" \
+    -targets "${TARGET_DIR:-$(pwd)/targets}" -target-meta config/"${TARGET_META:-targets-metadata.yml}" \
+    -snapshot "${SNAPSHOT_KEY}" -timestamp "${TIMESTAMP_KEY}"
 
-git checkout -b setup-root
-git add ceremony/
-git commit -s -a -m "Setting up root for ${GITHUB_USER}"
-git push -f origin setup-root
-
-# Open the browser
-open "https://github.com/${GITHUB_USER}/root-signing/pull/new/setup-root" || xdg-open "https://github.com/${GITHUB_USER}/root-signing/pull/new/setup-root"
-
+commit_and_push_changes setup-root

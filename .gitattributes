@@ -1,0 +1,3 @@
+# Line endings for TUF metadata and targets should be normalised and consistent
+ceremony/**     text eol=lf
+repository/**   text eol=lf

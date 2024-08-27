@@ -1,34 +1,46 @@
+//
+// Copyright 2021 The Sigstore Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package keys
 
 import (
 	"context"
 	"crypto"
 	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rsa"
 	"crypto/x509"
 	"encoding/asn1"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 
+	"github.com/sigstore/sigstore/pkg/cryptoutils"
 	"github.com/sigstore/sigstore/pkg/signature"
-	"github.com/sigstore/sigstore/pkg/signature/kms"
 	"github.com/sigstore/sigstore/pkg/signature/options"
 	"github.com/theupdateframework/go-tuf/data"
+	"github.com/theupdateframework/go-tuf/pkg/keys"
 
 	// Register the provider-specific plugins
 	_ "github.com/sigstore/sigstore/pkg/signature/kms/gcp"
 )
 
 // See https://developers.yubico.com/PIV/Introduction/PIV_attestation.html
-var oidExtensionSerialNumber = []int{1, 3, 6, 1, 4, 1, 41482, 3, 7}
+var OidExtensionSerialNumber = []int{1, 3, 6, 1, 4, 1, 41482, 3, 7}
 
 // SigningKey contains the serial number, public key, device cert, and key cert.
 type SigningKey struct {
@@ -38,65 +50,68 @@ type SigningKey struct {
 	KeyCert      *x509.Certificate
 }
 
-type SignerAndTufKey struct {
-	Signer signature.Signer
-	Key    *data.PublicKey
+type KeyValue struct {
+	PublicKey string `json:"public"`
 }
 
-type EcdsaPublic struct {
-	PublicKey data.HexBytes `json:"public"`
-}
-
-func toPubKey(pemBytes []byte) (*ecdsa.PublicKey, error) {
-	if pemBytes == nil {
-		return nil, errors.New("failed to get public key")
-	}
-	block, rest := pem.Decode(pemBytes)
-	if len(rest) != 0 {
-		return nil, errors.New("failed to parse public key PEM block")
-	}
-	pubkey, err := x509.ParsePKIXPublicKey(block.Bytes)
-	if err != nil {
-		return nil, err
-	}
-	return pubkey.(*ecdsa.PublicKey), nil
+func (kv *KeyValue) Unmarshal(pubKey *data.PublicKey) error {
+	return json.Unmarshal(pubKey.Value, kv)
 }
 
 func ToCert(pemBytes []byte) (*x509.Certificate, error) {
-	if pemBytes == nil {
-		return nil, errors.New("failed to get cert")
+	certs, err := cryptoutils.UnmarshalCertificatesFromPEMLimited(pemBytes, 2)
+	if err != nil {
+		return nil, err
 	}
-	block, rest := pem.Decode(pemBytes)
-	if len(rest) != 0 {
-		return nil, errors.New("failed to parse certificate PEM block")
+	if len(certs) != 1 {
+		return nil, errors.New("expected one PEM encoded certificate")
 	}
-	return x509.ParseCertificate(block.Bytes)
+	return certs[0], nil
 }
 
 func ToSigningKey(serialNumber int, pubKey []byte, deviceCert []byte, keyCert []byte) (*SigningKey, error) {
 	// Creates a signing key from the PEM bytes of the public key, device cert, and key cert
-	key := SigningKey{SerialNumber: serialNumber}
 	var err error
-	if key.PublicKey, err = toPubKey(pubKey); err != nil {
-		return nil, err
-	}
-	if key.DeviceCert, err = ToCert(deviceCert); err != nil {
-		return nil, err
-	}
-	if key.KeyCert, err = ToCert(keyCert); err != nil {
-		return nil, err
-	}
-	return &key, nil
-}
-
-func ToTufKey(key SigningKey) (*data.PublicKey, error) {
-	pub := key.PublicKey
-	keyValBytes, err := json.Marshal(EcdsaPublic{PublicKey: elliptic.Marshal(pub.Curve, pub.X, pub.Y)})
+	pk, err := cryptoutils.UnmarshalPEMToPublicKey(pubKey)
 	if err != nil {
 		return nil, err
 	}
+	ecdsapk, ok := pk.(*ecdsa.PublicKey)
+	if !ok {
+		return nil, errors.New("expected ecdsa public key")
+	}
+	key := &SigningKey{
+		SerialNumber: serialNumber,
+		PublicKey:    ecdsapk}
+	key.DeviceCert, err = ToCert(deviceCert)
+	if err != nil {
+		return nil, err
+	}
+	key.KeyCert, err = ToCert(keyCert)
+	if err != nil {
+		return nil, err
+	}
+	return key, nil
+}
+
+// EcdsaTufKey returns a PEM-encoded TUF public key for an ecdsa key.
+func EcdsaTufKey(pub *ecdsa.PublicKey, deprecatedType bool) (*data.PublicKey, error) {
+	keyValBytes, err := json.Marshal(keys.EcdsaVerifier{
+		PublicKey: &keys.PKIXPublicKey{PublicKey: pub}})
+	if err != nil {
+		return nil, err
+	}
+
+	var keyType data.KeyType
+	if deprecatedType {
+		keyType = data.KeyTypeECDSA_SHA2_P256_OLD_FMT
+	} else {
+		keyType = data.KeyTypeECDSA_SHA2_P256
+	}
+
 	return &data.PublicKey{
-		Type:       data.KeyTypeECDSA_SHA2_P256,
+		// TODO: Update to new format for next key signing
+		Type:       keyType,
 		Scheme:     data.KeySchemeECDSA_SHA2_P256,
 		Algorithms: data.HashAlgorithms,
 		Value:      keyValBytes,
@@ -106,7 +121,7 @@ func ToTufKey(key SigningKey) (*data.PublicKey, error) {
 func getSerialNumber(c *x509.Certificate) (*int, error) {
 	// Retrieves the serial number from the OID extension in the certificate
 	for _, e := range c.Extensions {
-		if e.Id.Equal(oidExtensionSerialNumber) {
+		if e.Id.Equal(OidExtensionSerialNumber) {
 			var serial int
 			if rest, err := asn1.Unmarshal(e.Value, &serial); err != nil {
 				return nil, err
@@ -135,21 +150,24 @@ func SigningKeyFromDir(dirname string) (*SigningKey, error) {
 			fmt.Printf("panic accessing path %q: %v\n", path, err)
 			return err
 		}
-		if strings.HasSuffix(info.Name(), "_pubkey.pem") {
-			pubKey, err = ioutil.ReadFile(path)
+		switch {
+		case strings.HasSuffix(info.Name(), "_pubkey.pem"):
+			pubKey, err = os.ReadFile(path)
 			if err != nil {
 				return err
 			}
-		} else if strings.HasSuffix(info.Name(), "_key_cert.pem") {
-			keyCert, err = ioutil.ReadFile(path)
+		case strings.HasSuffix(info.Name(), "_key_cert.pem"):
+			keyCert, err = os.ReadFile(path)
 			if err != nil {
 				return err
 			}
-		} else if strings.HasSuffix(info.Name(), "_device_cert.pem") {
-			deviceCert, err = ioutil.ReadFile(path)
+		case strings.HasSuffix(info.Name(), "_device_cert.pem"):
+			deviceCert, err = os.ReadFile(path)
 			if err != nil {
 				return err
 			}
+		default:
+			return nil
 		}
 		return nil
 	})
@@ -187,31 +205,21 @@ func (key SigningKey) Verify(root *x509.Certificate) error {
 	return nil
 }
 
-func GetKmsSigningKey(ctx context.Context, keyRef string) (*SignerAndTufKey, error) {
-	kmsKey, err := kms.Get(ctx, keyRef, crypto.SHA256)
+// ConstructTufKey constructs a TUF public key from a given signer.
+func ConstructTufKey(ctx context.Context, signer signature.Signer, deprecated bool) (*data.PublicKey, error) {
+	pub, err := signer.PublicKey(options.WithContext(ctx))
 	if err != nil {
 		return nil, err
 	}
-	// KMS specified
-	pub, err := kmsKey.PublicKey(options.WithContext(ctx))
-	if err != nil {
-		return nil, err
-	}
-	switch kt := pub.(type) {
-	case *ecdsa.PublicKey:
-		keyValBytes, err := json.Marshal(EcdsaPublic{PublicKey: elliptic.Marshal(kt.Curve, kt.X, kt.Y)})
-		if err != nil {
-			return nil, err
-		}
-		return &SignerAndTufKey{Key: &data.PublicKey{
-			Type:       data.KeyTypeECDSA_SHA2_P256,
-			Scheme:     data.KeySchemeECDSA_SHA2_P256,
-			Algorithms: data.HashAlgorithms,
-			Value:      keyValBytes,
-		}, Signer: kmsKey}, nil
-	case *rsa.PublicKey:
-		return nil, errors.New("RSA keys not supported")
+	return ConstructTufKeyFromPublic(ctx, pub, deprecated)
+}
 
+// ConstructTufKey constructs a TUF public key from a public key
+func ConstructTufKeyFromPublic(_ context.Context, pubKey crypto.PublicKey, deprecated bool) (*data.PublicKey, error) {
+	switch kt := pubKey.(type) {
+	case *ecdsa.PublicKey:
+		return EcdsaTufKey(kt, deprecated)
+	default:
+		return nil, fmt.Errorf("ConstructTufKeyFromPublic: key type %s not supported", kt)
 	}
-	return nil, errors.New("not an ecdsa or rsa key")
 }

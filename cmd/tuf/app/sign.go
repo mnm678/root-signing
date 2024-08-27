@@ -1,3 +1,18 @@
+//
+// Copyright 2021 The Sigstore Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //go:build pivkey
 // +build pivkey
 
@@ -6,13 +21,11 @@ package app
 import (
 	"bytes"
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"strings"
 
 	"github.com/peterbourgon/ff/v3/ffcli"
-	"github.com/sigstore/cosign/pkg/cosign/pivkey"
 	"github.com/sigstore/root-signing/pkg/keys"
 	"github.com/sigstore/root-signing/pkg/repo"
 	"github.com/sigstore/sigstore/pkg/signature"
@@ -35,11 +48,13 @@ func (f *roleFlag) Set(value string) error {
 
 func Sign() *ffcli.Command {
 	var (
-		flagset    = flag.NewFlagSet("tuf sign", flag.ExitOnError)
-		roles      = roleFlag{}
-		repository = flagset.String("repository", "", "path to the staged repository")
-		sk         = flagset.Bool("sk", false, "indicates use of a hardware key for signing")
-		key        = flagset.String("key", "", "reference to an onine signer for signing")
+		flagset     = flag.NewFlagSet("tuf sign", flag.ExitOnError)
+		roles       = roleFlag{}
+		repository  = flagset.String("repository", "", "path to the staged repository")
+		sk          = flagset.Bool("sk", false, "indicates use of a hardware key for signing")
+		key         = flagset.String("key", "", "reference to a signer for signing")
+		bumpVersion = flagset.Bool("bump-version", false, "bumps the version; useful for re-signing without changes")
+		addOldType  = flagset.Bool("add-old-type", false, "Add a signature using the old key type")
 	)
 	flagset.Var(&roles, "roles", "role(s) to sign")
 	return &ffcli.Command{
@@ -48,9 +63,9 @@ func Sign() *ffcli.Command {
 		ShortHelp:  "tuf signs the top-level metadata for role in the given repository",
 		LongHelp: `tuf signs the top-level metadata for role in the given repository.
 		Signing a lower level, e.g. snapshot or timestamp, before signing the root and target
-		will trigger a warning. 
+		will trigger a warning.
 		One of sk or a key reference must be provided.
-		
+
 	EXAMPLES
 	# sign staged repository at ceremony/YYYY-MM-DD
 	tuf sign -role root -repository ceremony/YYYY-MM-DD`,
@@ -62,11 +77,11 @@ func Sign() *ffcli.Command {
 			if !*sk && *key == "" {
 				return flag.ErrHelp
 			}
-			signerAndKey, err := getSigner(ctx, *sk, *key)
+			signer, err := GetSigner(ctx, *sk, *key)
 			if err != nil {
 				return err
 			}
-			return SignCmd(ctx, *repository, roles, signerAndKey)
+			return SignCmd(ctx, *repository, roles, signer, *bumpVersion, *addOldType)
 		},
 	}
 }
@@ -107,28 +122,8 @@ func checkMetaForRole(store tuf.LocalStore, role []string) error {
 	return nil
 }
 
-func getSigner(ctx context.Context, sk bool, keyRef string) (*keys.SignerAndTufKey, error) {
-	if sk {
-		// This will give us the data.PublicKey with the correct id.
-		keyAndAttestations, err := GetKeyAndAttestation(ctx)
-		if err != nil {
-			return nil, err
-		}
-		pivKey, err := pivkey.GetKeyWithSlot("signature")
-		if err != nil {
-			return nil, err
-		}
-		signer, err := pivKey.SignerVerifier()
-		if err != nil {
-			return nil, err
-		}
-		return &keys.SignerAndTufKey{Signer: signer, Key: keyAndAttestations.key}, nil
-	}
-	// A key reference was provided.
-	return keys.GetKmsSigningKey(ctx, keyRef)
-}
-
-func SignCmd(ctx context.Context, directory string, roles []string, signer *keys.SignerAndTufKey) error {
+func SignCmd(ctx context.Context, directory string, roles []string,
+	signer signature.Signer, bumpVersion, addOldType bool) error {
 	store := tuf.FileSystemStore(directory, nil)
 
 	if err := checkMetaForRole(store, roles); err != nil {
@@ -136,7 +131,12 @@ func SignCmd(ctx context.Context, directory string, roles []string, signer *keys
 	}
 
 	for _, name := range roles {
-		if err := SignMeta(ctx, store, name+".json", signer.Signer, signer.Key); err != nil {
+		if bumpVersion {
+			if err := repo.BumpMetadataVersion(store, name); err != nil {
+				return err
+			}
+		}
+		if err := SignMeta(ctx, store, name+".json", signer, addOldType); err != nil {
 			return err
 		}
 	}
@@ -144,15 +144,22 @@ func SignCmd(ctx context.Context, directory string, roles []string, signer *keys
 	return nil
 }
 
-func SignMeta(ctx context.Context, store tuf.LocalStore, name string, signer signature.Signer, key *data.PublicKey) error {
+// Sign metadata. We always associate signatures with the TUF compliant key IDs.
+//
+// Note that if you were using old format exclusively (for testing), then this will
+// have no impact on repository validity: extraneous key IDs for the role that are
+// not attested to in the trusted root or parent delegation will be ignored.
+func SignMeta(ctx context.Context, store tuf.LocalStore, name string,
+	signer signature.Signer, addOldType bool) error {
 	fmt.Printf("Signing metadata for %s... \n", name)
 	s, err := repo.GetSignedMeta(store, name)
 	if err != nil {
 		return err
 	}
-	if (name == "root.json" || name == "targets.json") && s.Signatures == nil {
+	if (name == "root.json" || name == "targets.json") &&
+		!arePreEntriesDefined(s) {
 		// init-repo should have pre-populated these. don't lose them.
-		return errors.New("pre-entries not defined")
+		return fmt.Errorf("pre-entries not defined in %s", name)
 	}
 
 	// Sign payload
@@ -170,29 +177,90 @@ func SignMeta(ctx context.Context, store tuf.LocalStore, name string, signer sig
 		return err
 	}
 
-	sigs := make([]data.Signature, 0, len(s.Signatures))
+	// Get TUF public IDs associated to the signer.
+	pubKey, err := keys.ConstructTufKey(ctx, signer, false)
+	var candidateKeyIDs []string
+	if err != nil {
+		return err
+	}
+	candidateKeyIDs = append(candidateKeyIDs, pubKey.IDs()...)
+
+	if addOldType {
+		oldKey, err := keys.ConstructTufKey(ctx, signer, true)
+		if err != nil {
+			return err
+		}
+		candidateKeyIDs = append(candidateKeyIDs, oldKey.IDs()...)
+	}
+
+	role := strings.TrimSuffix(name, ".json")
+	roleSigningKeys, err := repo.GetSigningKeyIDsForRole(role, store)
+	if err != nil {
+		return err
+	}
+
+	// Filter key IDs with the role signing key map.
+	var keyIDs []string
+	for _, id := range candidateKeyIDs {
+		// We check to make sure that the key ID is associated with the role's keys.
+		if _, ok := roleSigningKeys[id]; !ok {
+			continue
+		}
+		keyIDs = append(keyIDs, id)
+	}
 
 	// Add it to your key entry
-	for _, id := range key.IDs() {
-		// If pre-entries are defined.
-		if s.Signatures != nil {
-			for _, entry := range s.Signatures {
+	var added bool
+	sigs := make([]data.Signature, 0, len(s.Signatures))
+
+	// If pre-entries are defined, update the entry with the new signature.
+	if arePreEntriesDefined(s) {
+		for _, entry := range s.Signatures {
+			// If this matches any of the key IDs, add the signature.
+			var matches bool
+			for _, id := range keyIDs {
 				if entry.KeyID == id {
 					sigs = append(sigs, data.Signature{
 						KeyID:     id,
 						Signature: sig,
 					})
-				} else {
-					sigs = append(sigs, entry)
+					added = true
+					matches = true
 				}
 			}
-		} else {
+			if !matches {
+				sigs = append(sigs, entry)
+			}
+		}
+	} else {
+		for _, id := range keyIDs {
 			sigs = append(sigs, data.Signature{
 				KeyID:     id,
 				Signature: sig,
 			})
+			added = true
 		}
 	}
 
-	return setSignedMeta(store, name, &data.Signed{Signatures: sigs, Signed: s.Signed})
+	if !added {
+		return fmt.Errorf("expected key IDs %s for metadata role %s, got %v",
+			strings.Join(keyIDs, ", "), name, roleSigningKeys)
+	}
+
+	return repo.SetSignedMeta(store, name, &data.Signed{Signatures: sigs, Signed: s.Signed})
+}
+
+// Pre-entries are defined when there are Signatures in the Signed metadata
+// in which Key IDs are defined with empty signatures.
+//
+// TODO(asraa): Add unit testing for pre-entries.
+func arePreEntriesDefined(s *data.Signed) bool {
+	if s.Signatures != nil {
+		for _, entry := range s.Signatures {
+			if len(entry.KeyID) != 0 && len(entry.Signature) == 0 {
+				return true
+			}
+		}
+	}
+	return false
 }
